@@ -17,10 +17,13 @@ from bot.game.paid_join import join_paid_game
 from bot.game.websocket_engine import WebSocketEngine
 from bot.game.settlement import settle_game
 from bot.memory.agent_memory import AgentMemory
+from bot.strategy.adaptive import AdaptiveLearner
 from bot.credentials import load_credentials, get_api_key
 from bot.config import (
     ADVANCED_MODE, ROOM_MODE, AUTO_WHITELIST,
     AUTO_SC_WALLET, ENABLE_MEMORY, AUTO_IDENTITY,
+    ENABLE_ADAPTIVE, LEARNING_RATE, DISCOUNT_GAMMA,
+    EPSILON_INIT, EPSILON_FLOOR,
 )
 from bot.utils.logger import get_logger
 
@@ -33,6 +36,7 @@ class Heartbeat:
     def __init__(self):
         self.api: MoltyAPI | None = None
         self.memory = AgentMemory()
+        self.learner: AdaptiveLearner | None = None
         self.running = True
         self._agent_key = "agent-1"  # Consistent dashboard key
         self._agent_name = "Agent"
@@ -82,6 +86,24 @@ class Heartbeat:
                 self.memory.set_agent_name(creds["agent_name"])
         else:
             log.info("Memory system disabled (ENABLE_MEMORY=false)")
+
+        # Build the adaptive learner from persisted policy (if any).
+        if ENABLE_ADAPTIVE:
+            policy_blob = self.memory.get_policy() if ENABLE_MEMORY else {}
+            self.learner = AdaptiveLearner.from_dict(policy_blob)
+            self.learner.alpha = LEARNING_RATE
+            self.learner.gamma = DISCOUNT_GAMMA
+            self.learner.epsilon_init = EPSILON_INIT
+            self.learner.epsilon_floor = EPSILON_FLOOR
+            self.learner.enabled = True
+            log.info(
+                "🧠 Adaptive learning ENABLED: α=%.2f γ=%.2f ε=%.2f games=%d q_states=%d",
+                self.learner.alpha, self.learner.gamma, self.learner.epsilon,
+                self.learner.games_played, len(self.learner.q_table),
+            )
+        else:
+            self.learner = None
+            log.info("Adaptive learning disabled (ENABLE_ADAPTIVE=false)")
 
         # Main loop — NEVER exits, NEVER crashes
         consecutive_errors = 0
@@ -245,14 +267,20 @@ class Heartbeat:
         self.memory.set_temp_game(game_id)
         await self.memory.save()
 
+        # Adaptive: sample bandit arms for this game.
+        if self.learner is not None and self.learner.enabled:
+            self.learner.start_game()
+
         # Run WebSocket engine — pass agent_key + name for dashboard
-        engine = WebSocketEngine(game_id, agent_id)
+        engine = WebSocketEngine(game_id, agent_id, learner=self.learner)
         engine.dashboard_key = self._agent_key
         engine.dashboard_name = self._agent_name
         game_result = await engine.run()
 
-        # Settle
-        await settle_game(game_result, entry_type, self.memory)
+        # Settle (also persists adaptive policy to memory file)
+        await settle_game(
+            game_result, entry_type, self.memory, learner=self.learner,
+        )
 
         log.info("Game complete. Starting next cycle in 5s...")
         await asyncio.sleep(5)

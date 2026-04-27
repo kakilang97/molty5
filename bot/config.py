@@ -71,3 +71,13 @@ ENABLE_MEMORY = os.getenv("ENABLE_MEMORY", "true").lower() == "true"         # Q
 ENABLE_AGENT_TOKEN = os.getenv("ENABLE_AGENT_TOKEN", "false").lower() == "true"  # Q8: agent token
 AUTO_IDENTITY = os.getenv("AUTO_IDENTITY", "true").lower() == "true"         # Q9: ERC-8004 auto-register
 
+# ── Adaptive learning (Q-learning + bandits) ─────────────────────────
+# When ENABLE_ADAPTIVE=true the bot learns a policy on top of the
+# rule-based brain.  Hard-safety rules (death-zone escape) are NEVER
+# learned; only discretionary macro choices and HP thresholds adapt.
+ENABLE_ADAPTIVE = os.getenv("ENABLE_ADAPTIVE", "true").lower() == "true"
+LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.20"))
+DISCOUNT_GAMMA = float(os.getenv("DISCOUNT_GAMMA", "0.90"))
+EPSILON_INIT = float(os.getenv("EPSILON_INIT", "0.30"))
+EPSILON_FLOOR = float(os.getenv("EPSILON_FLOOR", "0.05"))
+

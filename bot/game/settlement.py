@@ -2,17 +2,24 @@
 Game settlement — Phase 3: process game end, update memory, prepare for next game.
 """
 from bot.memory.agent_memory import AgentMemory
+from bot.strategy.adaptive import AdaptiveLearner
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
-async def settle_game(game_result: dict, entry_type: str, memory: AgentMemory):
+async def settle_game(
+    game_result: dict,
+    entry_type: str,
+    memory: AgentMemory,
+    learner: AdaptiveLearner | None = None,
+):
     """
     Process game end:
     1. Extract final stats
     2. Update memory (overall history + lessons)
-    3. Clear temp memory
+    3. Persist adaptive policy (Q-table + bandits) when a learner is given
+    4. Clear temp memory
     """
     result = game_result.get("result", game_result)
     is_winner = result.get("isWinner", False)
@@ -41,6 +48,16 @@ async def settle_game(game_result: dict, entry_type: str, memory: AgentMemory):
         memory.add_lesson(f"Top 3 finish (rank {final_rank}) with {kills} kills")
     elif kills == 0:
         memory.add_lesson("Zero kills — need more aggressive guardian/monster targeting")
+
+    # Persist adaptive policy (Q-table + bandit stats) so learning carries
+    # over across games and container restarts.
+    if learner is not None:
+        memory.set_policy(learner.to_dict())
+        log.info(
+            "Adaptive policy saved: games=%d q_states=%d combat_arm=%d heal_arm=%d",
+            learner.games_played, len(learner.q_table),
+            learner.last_combat_arm, learner.last_heal_arm,
+        )
 
     # Clear temp for next game
     memory.clear_temp()

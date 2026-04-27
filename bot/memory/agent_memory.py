@@ -1,7 +1,11 @@
 """
 Agent memory — persistent cross-game learning via molty-royale-context.json.
-Two sections: `overall` (persistent) and `temp` (per-game).
+Sections:
+- `overall`: persistent identity, hand-crafted strategy hints, history.
+- `temp`: per-game scratchpad.
+- `policy`: serialized `AdaptiveLearner` (Q-table, bandit stats, hyperparams).
 """
+import copy
 import json
 from pathlib import Path
 from typing import Optional
@@ -27,6 +31,7 @@ DEFAULT_MEMORY = {
         },
     },
     "temp": {},
+    "policy": {},
 }
 
 
@@ -34,8 +39,13 @@ class AgentMemory:
     """Read/write molty-royale-context.json with overall + temp sections."""
 
     def __init__(self):
-        self.data = dict(DEFAULT_MEMORY)
+        self.data = copy.deepcopy(DEFAULT_MEMORY)
         self._loaded = False
+
+    def _ensure_sections(self):
+        """Ensure all top-level sections exist after load (forward-compat)."""
+        for k, v in DEFAULT_MEMORY.items():
+            self.data.setdefault(k, copy.deepcopy(v))
 
     async def load(self):
         """Load memory from disk. Create default if missing."""
@@ -44,15 +54,20 @@ class AgentMemory:
             try:
                 raw = MEMORY_FILE.read_text(encoding="utf-8")
                 self.data = json.loads(raw)
+                self._ensure_sections()
                 self._loaded = True
-                log.info("Memory loaded: %d games, %d lessons",
-                         self.data["overall"]["history"]["totalGames"],
-                         len(self.data["overall"]["history"]["lessons"]))
+                log.info(
+                    "Memory loaded: %d games, %d lessons, q_states=%d",
+                    self.data["overall"]["history"]["totalGames"],
+                    len(self.data["overall"]["history"]["lessons"]),
+                    len(self.data.get("policy", {}).get("q_table", {})),
+                )
             except (json.JSONDecodeError, KeyError) as e:
                 log.warning("Memory file corrupt, using defaults: %s", e)
-                self.data = dict(DEFAULT_MEMORY)
+                self.data = copy.deepcopy(DEFAULT_MEMORY)
         else:
             log.info("No memory file — starting fresh")
+            self._ensure_sections()
 
     async def save(self):
         """Persist memory to disk."""
@@ -112,3 +127,13 @@ class AgentMemory:
             lessons.append(lesson)
             if len(lessons) > max_lessons:
                 lessons.pop(0)
+
+    # ── Adaptive policy persistence ──────────────────────────────────
+
+    def get_policy(self) -> dict:
+        """Return raw serialized policy dict (may be empty)."""
+        return self.data.get("policy", {}) or {}
+
+    def set_policy(self, policy: dict):
+        """Replace serialized policy dict."""
+        self.data["policy"] = policy or {}

@@ -16,7 +16,13 @@ import websockets
 from bot.config import WS_URL, SKILL_VERSION
 from bot.credentials import get_api_key
 from bot.game.action_sender import ActionSender, COOLDOWN_ACTIONS, FREE_ACTIONS
-from bot.strategy.brain import decide_action, reset_game_state, learn_from_map
+from bot.strategy.brain import (
+    decide_action,
+    reset_game_state,
+    learn_from_map,
+    available_macros,
+)
+from bot.strategy.adaptive import AdaptiveLearner, featurize_state
 from bot.dashboard.state import dashboard_state
 from bot.utils.rate_limiter import ws_limiter
 from bot.utils.logger import get_logger
@@ -62,7 +68,8 @@ def _update_dz_knowledge(view: dict):
 class WebSocketEngine:
     """Manages the gameplay WebSocket session."""
 
-    def __init__(self, game_id: str, agent_id: str):
+    def __init__(self, game_id: str, agent_id: str,
+                 learner: AdaptiveLearner | None = None):
         self.game_id = game_id
         self.agent_id = agent_id
         self.action_sender = ActionSender()
@@ -75,6 +82,12 @@ class WebSocketEngine:
         # Dashboard key/name — set by heartbeat before .run()
         self.dashboard_key = agent_id  # fallback to agent_id
         self.dashboard_name = "Agent"
+        # Adaptive learner — optional; rule-based brain still runs without it.
+        self.learner = learner
+        self._prev_state: tuple | None = None
+        self._prev_macro: str | None = None
+        self._prev_view: dict | None = None
+        self._cumulative_reward: float = 0.0
 
     async def run(self) -> dict:
         """
@@ -215,7 +228,30 @@ class WebSocketEngine:
         # ── game_ended ────────────────────────────────────────────────
         elif msg_type == "game_ended":
             log.info("═══ GAME ENDED ═══")
-            reset_game_state()  # Clear curse tracking for next game
+            reset_game_state()  # Clear per-game tracking (DZ knowledge etc.)
+            # Adaptive: terminal update + bandit reward.
+            if self.learner is not None and self.learner.enabled:
+                result = msg.get("result", msg) if isinstance(msg, dict) else {}
+                rewards = result.get("rewards", {}) if isinstance(result, dict) else {}
+                bandit_r = AdaptiveLearner.terminal_reward(
+                    is_winner=bool(result.get("isWinner", False)),
+                    final_rank=int(result.get("finalRank", 0) or 0),
+                    kills=int(result.get("kills", 0) or 0),
+                    smoltz_earned=float(rewards.get("sMoltz", 0) or 0),
+                )
+                bandit_r += self._cumulative_reward
+                # Final Q-update with terminal flag (no bootstrap).
+                if self._prev_state is not None and self._prev_macro is not None:
+                    self.learner.observe_step(
+                        self._prev_state, self._prev_macro,
+                        bandit_r, self._prev_state, done=True,
+                    )
+                self.learner.observe_game_end(bandit_r)
+                log.info(
+                    "🧠 Adaptive game-end: bandit_reward=%.2f, ε=%.3f, games=%d, q_states=%d",
+                    bandit_r, self.learner.epsilon,
+                    self.learner.games_played, len(self.learner.q_table),
+                )
             self.game_result = msg
             return msg
 
@@ -393,9 +429,69 @@ class WebSocketEngine:
         # Continuous DZ tracking from every view
         _update_dz_knowledge(view)
 
-        # Run strategy brain
+        # Adaptive policy: featurize → reward → choose macro
+        macro_hint: str | None = None
+        policy_thresholds: dict | None = None
+        cur_state = None
+        if self.learner is not None and self.learner.enabled:
+            cur_state = featurize_state(view)
+            # Reward shaping from previous → current view.  We keep a
+            # dedicated `_prev_view` snapshot because `self.last_view` has
+            # already been mutated to the current view by the caller.
+            if (
+                self._prev_state is not None
+                and self._prev_macro is not None
+                and self._prev_view is not None
+            ):
+                step_r = AdaptiveLearner.step_reward(self._prev_view, view)
+                self.learner.observe_step(
+                    self._prev_state, self._prev_macro, step_r, cur_state,
+                )
+                self._cumulative_reward += step_r
+            # Choose macro for THIS turn.
+            allowed = available_macros(view)
+            macro_hint = self.learner.choose_macro(cur_state, allowed)
+            policy_thresholds = {
+                "combat_hp": self.learner.last_combat_arm,
+                "heal_hp": self.learner.last_heal_arm,
+            }
+            # Periodic dashboard snapshot of top Q-values.
+            if self.learner.training_step % 5 == 0:
+                snap = self.learner.policy_snapshot(cur_state, top_n=3)
+                dashboard_state.update_agent(self.dashboard_key, {
+                    "policy_macro": macro_hint,
+                    "policy_topq": [(m, round(q, 3)) for m, q in snap],
+                    "policy_epsilon": round(self.learner.epsilon, 3),
+                    "policy_games": self.learner.games_played,
+                    "policy_q_states": len(self.learner.q_table),
+                })
+
+        # Run strategy brain (passing learned thresholds + macro hint).
         can_act = self.action_sender.can_send_cooldown_action()
-        decision = decide_action(view, can_act)
+        decision = decide_action(
+            view,
+            can_act,
+            policy_thresholds=policy_thresholds,
+            macro_hint=macro_hint,
+        )
+
+        # Stash for next turn's reward computation.  Keep a deep-ish copy
+        # of just the fields step_reward() inspects so later mutations to
+        # `view` (game state churn) don't corrupt the diff.
+        if cur_state is not None:
+            self._prev_state = cur_state
+            self._prev_macro = macro_hint
+            prev_self = view.get("self", {}) or {}
+            self._prev_view = {
+                "self": {
+                    "hp": prev_self.get("hp", 0),
+                    "kills": prev_self.get("kills", 0),
+                    "smoltz": prev_self.get("smoltz", prev_self.get("balance", 0)),
+                    "isAlive": prev_self.get("isAlive", True),
+                },
+                "aliveCount": view.get("aliveCount", 0),
+                "balance": view.get("balance", 0),
+            }
 
         if decision is None:
             return  # No action needed now

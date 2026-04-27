@@ -134,7 +134,71 @@ def reset_game_state():
     log.info("Strategy brain reset for new game")
 
 
-def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict | None:
+def available_macros(view: dict) -> list[str]:
+    """Return the subset of macros that are realisable in this view.
+
+    The adaptive learner uses this to mask its action space so we don't
+    waste exploration on an impossible engagement.  This is purely a
+    heuristic — the rule chain in `decide_action` still has the final
+    say on what action gets emitted.
+    """
+    self_data = view.get("self", {}) or {}
+    region = view.get("currentRegion", {}) or {}
+    visible_agents = view.get("visibleAgents", []) or []
+    visible_monsters = view.get("visibleMonsters", []) or []
+    inventory = self_data.get("inventory", []) or []
+
+    macros: list[str] = []
+    has_player = any(
+        isinstance(a, dict) and a.get("isAlive", True)
+        and not a.get("isGuardian", False)
+        and a.get("id") != self_data.get("id")
+        for a in visible_agents
+    )
+    has_guardian = any(
+        isinstance(a, dict) and a.get("isAlive", True)
+        and a.get("isGuardian", False)
+        for a in visible_agents
+    )
+    has_monster = any(
+        isinstance(m, dict) and (m.get("hp", 0) or 0) > 0
+        for m in visible_monsters
+    )
+    has_heal = any(
+        isinstance(i, dict)
+        and (i.get("typeId") or "").lower() in {"medkit", "bandage", "emergency_food"}
+        for i in inventory
+    )
+    interactables = region.get("interactables", []) if isinstance(region, dict) else []
+    has_facility = any(
+        isinstance(f, dict) and not f.get("isUsed") for f in interactables
+    )
+    connections = view.get("connectedRegions", []) or region.get("connections", [])
+    has_move = bool(connections)
+
+    if has_player:
+        macros.append("engage_player")
+    if has_guardian:
+        macros.append("engage_guardian")
+    if has_monster:
+        macros.append("farm_monster")
+    if has_heal:
+        macros.append("heal")
+    if has_facility:
+        macros.append("interact")
+    if has_move:
+        macros.extend(["flee", "move_explore"])
+    macros.append("rest")
+    return macros
+
+
+def decide_action(
+    view: dict,
+    can_act: bool,
+    memory_temp: dict = None,
+    policy_thresholds: dict | None = None,
+    macro_hint: str | None = None,
+) -> dict | None:
     """
     Main decision engine. Returns action dict or None (wait).
 
@@ -154,7 +218,18 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     10. Rest
 
     Uses ALL api-summary.md view fields for decision making.
+
+    Adaptive parameters:
+    - `policy_thresholds`: dict with optional keys `combat_hp` and `heal_hp`
+      controlling discretionary HP thresholds.  Falls back to defaults when
+      omitted (preserving original rule-based behaviour).
+    - `macro_hint`: optional macro name from `bot.strategy.adaptive` to bias
+      discretionary priorities.  Hard-safety priorities (death-zone escape,
+      free pickups, weapon equip) always run first regardless of the hint.
     """
+    policy_thresholds = policy_thresholds or {}
+    combat_hp_threshold_low = int(policy_thresholds.get("combat_hp", 40))
+    heal_hp_threshold = int(policy_thresholds.get("heal_hp", 70))
     self_data = view.get("self", {})
     region = view.get("currentRegion", {})
     hp = self_data.get("hp", 100)
@@ -280,13 +355,19 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     # ── Priority 3: Healing management ─────────────────────────────
     # HP < 30 = CRITICAL: use Bandage first (30 HP), then Medkit (50 HP)
-    # HP < 70 = MODERATE: use Emergency Food first (20 HP), save better items
+    # HP < heal_hp_threshold = MODERATE: use Emergency Food first.
+    # heal_hp_threshold is learned via the bandit (default 70).
+    # macro_hint == "heal" lowers the bar so the policy can trigger heals
+    # the rule chain would have skipped.
+    heal_threshold = heal_hp_threshold
+    if macro_hint == "heal":
+        heal_threshold = max(heal_threshold, 90)
     if hp < 30:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"CRITICAL HEAL: HP={hp}, using {heal.get('typeId', 'heal')}"}
-    elif hp < 70:
+    elif hp < heal_threshold:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
@@ -303,9 +384,16 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # ── Priority 5: Guardian farming (v1.5.2: 120 sMoltz per kill!) ─
     # Only 5 guardians per free room — each worth 120 sMoltz!
     # Guardians now ATTACK back — only fight if we can win.
+    # Adaptive override: macro_hint == "engage_guardian" lowers the HP gate;
+    # macro_hint == "flee" disables guardian engagement entirely.
+    guardian_min_hp = 35
+    if macro_hint == "engage_guardian":
+        guardian_min_hp = 20
+    elif macro_hint == "flee":
+        guardian_min_hp = 999  # impossible — skip
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
-    if guardians and ep >= 2 and hp >= 35:
+    if guardians and ep >= 2 and hp >= guardian_min_hp:
         target = _select_weakest(guardians)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -323,9 +411,17 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                   f"(120 sMoltz! dmg={my_dmg} vs {guardian_dmg})"}
 
     # ── Priority 6: Favorable agent combat ────────────────────────
-    # Be more aggressive when fewer agents remain (late game)
-    # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%)
-    hp_threshold = 40 if alive_count > 20 else 25
+    # Be more aggressive when fewer agents remain (late game).
+    # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%).
+    # The base threshold is the bandit-tuned `combat_hp_threshold_low`
+    # in early/mid game; in late game (alive_count<=20) we always
+    # accept aggressive engagement.  macro_hint shifts both ways:
+    # "engage_player" = more aggressive, "flee"/"rest" = skip combat.
+    hp_threshold = combat_hp_threshold_low if alive_count > 20 else 25
+    if macro_hint == "engage_player":
+        hp_threshold = max(15, hp_threshold - 15)
+    elif macro_hint in ("flee", "rest", "heal", "interact"):
+        hp_threshold = 999  # skip combat — let later priorities handle
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
                and a.get("id") != self_data.get("id")]
@@ -347,6 +443,8 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     # ── Priority 7: Monster farming ───────────────────────────────
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
+    if macro_hint in ("flee", "rest", "heal"):
+        monsters = []  # macro vetoes farming
     if monsters and ep >= 2:
         target = _select_weakest(monsters)
         w_range = get_weapon_range(equipped)
@@ -372,15 +470,27 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     # ── Priority 9: Strategic movement ────────────────────────────
     # Use connectedRegions — NEVER move into DZ or pending DZ!
-    if ep >= move_ep_cost and connections:
+    # macro_hint == "flee" forces a move toward the safest neighbour;
+    # macro_hint == "rest" skips movement so we fall through to rest.
+    if macro_hint == "flee" and connections:
+        safe = _find_safe_region(connections, danger_ids, view)
+        if safe and ep >= move_ep_cost:
+            return {"action": "move", "data": {"regionId": safe},
+                    "reason": "POLICY FLEE: macro=flee, repositioning"}
+    if macro_hint != "rest" and ep >= move_ep_cost and connections:
         move_target = _choose_move_target(connections, danger_ids,
                                            region, visible_items, alive_count)
         if move_target:
             return {"action": "move", "data": {"regionId": move_target},
                     "reason": "EXPLORE: Moving to better position"}
 
-    # ── Priority 10: Rest (EP < 4 and safe) ───────────────────────
-    if ep < 4 and not enemies and not region.get("isDeathZone") and region_id not in danger_ids:
+    # ── Priority 10: Rest (EP < 4 and safe, OR macro_hint=rest) ──
+    rest_safe = (
+        not enemies
+        and not region.get("isDeathZone")
+        and region_id not in danger_ids
+    )
+    if rest_safe and (ep < 4 or macro_hint == "rest"):
         return {"action": "rest", "data": {},
                 "reason": f"REST: EP={ep}/{max_ep}, area is safe (+1 bonus EP)"}
 
